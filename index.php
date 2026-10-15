@@ -106,46 +106,42 @@ function requestBody(int $max): string {
     return $body;
 }
 
-function pdo(array $cfg): PDO {
-    static $connection = null;
-    if ($connection instanceof PDO) return $connection;
-    if (($cfg['db_password'] ?? '') === '') {
-        throw new RuntimeException('Gateway database password is not configured on server');
-    }
-    $dsn = sprintf('mysql:host=%s;dbname=%s;charset=utf8mb4', $cfg['db_host'], $cfg['db_name']);
-    $connection = new PDO($dsn, $cfg['db_user'], $cfg['db_password'], [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-        PDO::ATTR_EMULATE_PREPARES => false,
-    ]);
-    return $connection;
-}
-
 function checkRateLimit(array $cfg): void {
-    // DB-backed per-IP limiter; no schema setup needed.
+    // File-based rate limiter works on shared PHP hosting without requiring a
+    // separate database connection or manual SQL setup.
     $ip = (string)($_SERVER['REMOTE_ADDR'] ?? 'unknown');
-    $key = hash_hmac('sha256', $ip, (string)($cfg['token_pepper'] ?: $cfg['service_name']));
-    $db = pdo($cfg);
-    $db->exec("CREATE TABLE IF NOT EXISTS gateway_rate_limits (
-        rate_key CHAR(64) NOT NULL PRIMARY KEY,
-        window_start INT UNSIGNED NOT NULL,
-        request_count INT UNSIGNED NOT NULL,
-        INDEX idx_window_start (window_start)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
-    $now = time();
-    $limit = max(30, (int)$cfg['rate_limit_per_minute']);
-    $stmt = $db->prepare("INSERT INTO gateway_rate_limits(rate_key,window_start,request_count)
-        VALUES(?,?,1) ON DUPLICATE KEY UPDATE
-        request_count = IF(window_start < ?, 1, request_count + 1),
-        window_start = IF(window_start < ?, ?, window_start)");
-    $cutoff = $now - 60;
-    $stmt->execute([$key, $now, $cutoff, $cutoff, $now]);
-    $read = $db->prepare('SELECT request_count FROM gateway_rate_limits WHERE rate_key = ?');
-    $read->execute([$key]);
-    $count = (int)$read->fetchColumn();
-    if ($count > $limit) {
-        header('Retry-After: 60');
-        jsonResponse(429, ['ok'=>false,'error'=>'rate_limit_exceeded','retry_after'=>60]);
+    $key = hash('sha256', $ip);
+    $dir = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'pluschat-gateway-limits';
+    if (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir)) {
+        throw new RuntimeException('Rate-limit storage unavailable');
+    }
+    @chmod($dir, 0700);
+    $file = $dir . DIRECTORY_SEPARATOR . $key . '.json';
+    $handle = @fopen($file, 'c+');
+    if ($handle === false) throw new RuntimeException('Rate-limit storage unavailable');
+    try {
+        if (!flock($handle, LOCK_EX)) throw new RuntimeException('Rate-limit lock unavailable');
+        $raw = stream_get_contents($handle);
+        $state = is_string($raw) ? json_decode($raw, true) : null;
+        $now = time();
+        $window = is_array($state) ? (int)($state['window'] ?? 0) : 0;
+        $count = is_array($state) ? (int)($state['count'] ?? 0) : 0;
+        if ($window < $now - 60) {
+            $window = $now;
+            $count = 0;
+        }
+        $count++;
+        ftruncate($handle, 0);
+        rewind($handle);
+        fwrite($handle, json_encode(['window'=>$window, 'count'=>$count]));
+        fflush($handle);
+        flock($handle, LOCK_UN);
+        if ($count > max(30, (int)($cfg['rate_limit_per_minute'] ?? 120))) {
+            header('Retry-After: 60');
+            jsonResponse(429, ['ok'=>false,'error'=>'rate_limit_exceeded','retry_after'=>60]);
+        }
+    } finally {
+        fclose($handle);
     }
 }
 
