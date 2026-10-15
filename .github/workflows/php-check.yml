@@ -1,0 +1,25 @@
+name: PHP validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: curl, pdo, pdo_mysql
+          coverage: none
+      - name: PHP syntax checks
+        run: |
+          php -l index.php
+          php -l config.example.php
